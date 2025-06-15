@@ -16,7 +16,7 @@ setupserver.sh
 
 | Kategori       | Paket                                                                           |
 |----------------|----------------------------------------------------------------------------------|
-| Sistem         | `htop`, `nano`, `tree`, `curl`, `wget`, `unzip`, `zip`, `git`, `yum-utils`      |
+| Sistem         | `htop`, `nano`, `tree`, `curl`, `wget`, `unzip`, `zip`, `git`, `yum-utils`, `EPEL`     |
 | Jaringan       | `net-tools`, `bind-utils`, `traceroute`, `snmp`, `chrony`                       |
 | Shell/Terminal | `bash-completion`                                                               |
 
