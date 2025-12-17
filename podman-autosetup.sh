@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Setup Podman + tools + configs + Quadlet deployments (anti-gagal) + colored logs
-# Includes: Web HaloEats, Web Fornet, Web Halss, Observium, Nginx Proxy Manager, Zabbix Integration
-
+# Podman + tools + configs + Quadlet deployments (anti-gagal) + visible loading/progress
+# Target: Alma/RHEL-like
 set -euo pipefail
 IFS=$'\n\t'
 
 LOG_FILE="/var/log/podman-autosetup.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 
-# ---- Color handling (only for TTY) ----
+# ============ Colors (TTY only) ============
 if [[ -t 1 ]]; then
   C_RESET="\033[0m"
   C_DIM="\033[2m"
@@ -24,29 +23,63 @@ fi
 
 ts() { date +"%Y-%m-%d %H:%M:%S"; }
 
-log() {
-  local msg="$*"
-  # write plain (no ANSI) to log file
-  echo -e "[$(ts)] ${msg}" | sed -r 's/\x1B\[[0-9;]*[mK]//g' >>"$LOG_FILE"
-  # print to screen (colored already inside msg)
-  echo -e "[$(ts)] ${msg}"
+# write plain (no ANSI) to log file, show colored to screen
+_log_plain_to_file() {
+  echo -e "$*" | sed -r 's/\x1B\[[0-9;]*[mK]//g' >>"$LOG_FILE"
 }
 
-info() { log "${C_BLUE}ℹ️  $*${C_RESET}"; }
-ok()   { log "${C_GREEN}✅ $*${C_RESET}"; }
-warn() { log "${C_YELLOW}⚠️  $*${C_RESET}"; }
-err()  { log "${C_RED}❌ $*${C_RESET}"; }
+log() {
+  local msg="[$(ts)] $*"
+  _log_plain_to_file "$msg"
+  echo -e "$msg"
+}
+
+info(){ log "${C_BLUE}ℹ️  $*${C_RESET}"; }
+ok(){   log "${C_GREEN}✅ $*${C_RESET}"; }
+warn(){ log "${C_YELLOW}⚠️  $*${C_RESET}"; }
+err(){  log "${C_RED}❌ $*${C_RESET}"; }
 
 FAILED_STEPS=()
 fail_step() { FAILED_STEPS+=("$1"); err "$1"; }
 
 trap 'err "Script error di baris $LINENO (cek log: $LOG_FILE)"; exit 1' ERR
 
+# ============ Spinner (for commands redirected to log) ============
+spinner() {
+  local pid="$1"
+  local msg="${2:-Working...}"
+  local spin='-\|/'
+  local i=0
+
+  if [[ ! -t 1 ]]; then
+    wait "$pid"; return $?
+  fi
+
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$(( (i + 1) % 4 ))
+    printf "\r[%s] %b%s%b %s" "$(ts)" "$C_DIM" "$msg" "$C_RESET" "${spin:$i:1}"
+    sleep 0.15
+  done
+  wait "$pid"
+  local rc=$?
+  printf "\r[%s] %b%s%b %s\n" "$(ts)" "$C_DIM" "$msg" "$C_RESET" " "
+  return $rc
+}
+
+run_with_spinner() {
+  local msg="$1"; shift
+  ("$@" >>"$LOG_FILE" 2>&1) &
+  local pid=$!
+  spinner "$pid" "$msg"
+}
+
+# ============ Root check ============
 if [[ "${EUID}" -ne 0 ]]; then
   err "Harus dijalankan sebagai root. Jalankan: sudo -i"
   exit 1
 fi
 
+# ============ Package manager ============
 PKG_MGR=""
 if command -v dnf >/dev/null 2>&1; then
   PKG_MGR="dnf"
@@ -57,22 +90,32 @@ else
   exit 1
 fi
 
-pkg_update() {
+pkg_is_installed() { rpm -q "$1" >/dev/null 2>&1; }
+
+pkg_makecache() {
   info "Repo makecache ($PKG_MGR)..."
-  if ! $PKG_MGR -y makecache >>"$LOG_FILE" 2>&1; then
+  if ! run_with_spinner "Repo makecache..." "$PKG_MGR" -y makecache; then
     warn "makecache gagal (repo/network). lanjut..."
   else
     ok "Repo metadata siap."
   fi
 }
 
-pkg_install() {
-  local pkgs=("$@")
-  info "Install: ${pkgs[*]}"
-  $PKG_MGR -y install "${pkgs[@]}" >>"$LOG_FILE" 2>&1
+pkg_install_one() {
+  local p="$1"
+  if pkg_is_installed "$p"; then
+    ok "Paket sudah ada: $p"
+    return 0
+  fi
+  info "Install paket: $p"
+  if run_with_spinner "Installing $p..." "$PKG_MGR" -y install "$p"; then
+    ok "Terpasang: $p"
+    return 0
+  else
+    fail_step "Gagal install paket: $p"
+    return 1
+  fi
 }
-
-pkg_is_installed() { rpm -q "$1" >/dev/null 2>&1; }
 
 enable_service_now() {
   local svc="$1"
@@ -88,10 +131,138 @@ enable_service_now() {
   fi
 }
 
+systemd_reload() {
+  info "systemctl daemon-reload"
+  if systemctl daemon-reload >>"$LOG_FILE" 2>&1; then
+    ok "daemon-reload OK"
+  else
+    fail_step "daemon-reload gagal"
+  fi
+}
+
+start_service() {
+  local svc="$1"
+  info "Start: $svc"
+  if systemctl start "$svc" >>"$LOG_FILE" 2>&1; then
+    ok "Running: $svc"
+  else
+    fail_step "Gagal start: $svc"
+  fi
+}
+
+enable_now_services() {
+  info "Enable --now: $*"
+  if systemctl enable --now "$@" >>"$LOG_FILE" 2>&1; then
+    ok "Enable --now sukses."
+  else
+    fail_step "Enable --now gagal."
+    return 1
+  fi
+}
+
+# ============ Podman pull progress ============
+podman_pull_pretty() {
+  local img="$1"
+
+  # Skip pull for local-tag images
+  if [[ "$img" =~ ^localhost/ ]]; then
+    warn "Skip pull (image lokal): $img"
+    return 0
+  fi
+
+  info "Pull image: $img"
+  if [[ -t 1 ]]; then
+    # show progress bar, also log via tee
+    if podman pull --progress=bar "$img" 2>&1 | tee -a "$LOG_FILE"; then
+      ok "Pull OK: $img"
+      return 0
+    else
+      fail_step "Pull gagal: $img"
+      return 1
+    fi
+  else
+    if run_with_spinner "Pulling $img..." podman pull "$img"; then
+      ok "Pull OK: $img"
+      return 0
+    else
+      fail_step "Pull gagal: $img"
+      return 1
+    fi
+  fi
+}
+
+# ============ Git helpers ============
+git_upsert_repo() {
+  local repo_url="$1"
+  local dest_dir="$2"
+
+  mkdir -p "$(dirname "$dest_dir")"
+
+  if [[ -d "$dest_dir/.git" ]]; then
+    info "git pull: $dest_dir"
+    if [[ -t 1 ]]; then
+      if git -C "$dest_dir" pull --rebase 2>&1 | tee -a "$LOG_FILE"; then
+        ok "Git pull OK: $dest_dir"
+      else
+        fail_step "Git pull gagal: $dest_dir"
+      fi
+    else
+      if run_with_spinner "Pulling $(basename "$dest_dir")..." git -C "$dest_dir" pull --rebase; then
+        ok "Git pull OK: $dest_dir"
+      else
+        fail_step "Git pull gagal: $dest_dir"
+      fi
+    fi
+  else
+    info "git clone: $repo_url -> $dest_dir"
+    if [[ -t 1 ]]; then
+      if git clone --progress "$repo_url" "$dest_dir" 2>&1 | tee -a "$LOG_FILE"; then
+        ok "Git clone OK: $dest_dir"
+      else
+        fail_step "Git clone gagal: $dest_dir"
+      fi
+    else
+      if run_with_spinner "Cloning $(basename "$dest_dir")..." git clone "$repo_url" "$dest_dir"; then
+        ok "Git clone OK: $dest_dir"
+      else
+        fail_step "Git clone gagal: $dest_dir"
+      fi
+    fi
+  fi
+}
+
+pull_images_from_quadlet_dir() {
+  local quadlet_dir="$1"
+  if [[ ! -d "$quadlet_dir" ]]; then
+    warn "Folder quadlet tidak ditemukan: $quadlet_dir (skip pull image)"
+    return 0
+  fi
+
+  info "Scan Image= dari *.container di: $quadlet_dir"
+
+  local images=()
+  while IFS= read -r f; do
+    local img
+    img="$(grep -E '^\s*Image\s*=' "$f" | head -n1 | cut -d'=' -f2- | xargs || true)"
+    [[ -n "$img" ]] && images+=("$img")
+  done < <(find "$quadlet_dir" -maxdepth 1 -type f -name "*.container" 2>/dev/null)
+
+  if [[ "${#images[@]}" -eq 0 ]]; then
+    warn "Tidak ada Image= ditemukan di *.container (skip pull)."
+    return 0
+  fi
+
+  mapfile -t images < <(printf "%s\n" "${images[@]}" | awk '!seen[$0]++')
+  for img in "${images[@]}"; do
+    podman_pull_pretty "$img" || true
+  done
+}
+
+# ============ Config steps ============
 ensure_epel() {
   if ! pkg_is_installed epel-release; then
-    info "Install epel-release (untuk htop, dll)..."
-    if pkg_install epel-release; then
+    info "Install epel-release..."
+    if run_with_spinner "Installing epel-release..." "$PKG_MGR" -y install epel-release; then
       ok "epel-release terpasang."
     else
       warn "epel-release gagal dipasang. lanjut..."
@@ -106,10 +277,9 @@ install_base_packages() {
   log "${C_BOLD}📦 Install paket dasar${C_RESET}"
   log "=============================="
 
-  pkg_update
+  pkg_makecache
   ensure_epel
 
-  # "yum-utils" di sebagian RHEL/Alma modern bisa tidak ada -> fallback dnf-utils
   local pkgs=(
     curl wget git nano tree
     net-tools bind-utils traceroute
@@ -120,25 +290,17 @@ install_base_packages() {
   )
 
   for p in "${pkgs[@]}"; do
-    if pkg_is_installed "$p"; then
-      ok "Paket sudah ada: $p"
-    else
-      if pkg_install "$p"; then
-        ok "Terpasang: $p"
-      else
-        fail_step "Gagal install paket: $p"
-      fi
-    fi
+    pkg_install_one "$p" || true
   done
 
-  # utils tambahan: yum-utils atau dnf-utils
+  # yum-utils optional; fallback dnf-utils
   if pkg_is_installed yum-utils; then
     ok "Paket sudah ada: yum-utils"
   else
     info "(Opsional) Install yum-utils/dnf-utils..."
-    if $PKG_MGR -y install yum-utils >>"$LOG_FILE" 2>&1; then
+    if run_with_spinner "Installing yum-utils..." "$PKG_MGR" -y install yum-utils; then
       ok "Terpasang: yum-utils"
-    elif $PKG_MGR -y install dnf-utils >>"$LOG_FILE" 2>&1; then
+    elif run_with_spinner "Installing dnf-utils..." "$PKG_MGR" -y install dnf-utils; then
       ok "Terpasang: dnf-utils"
     else
       warn "yum-utils/dnf-utils tidak bisa diinstall (skip)."
@@ -148,27 +310,12 @@ install_base_packages() {
 
 install_podman_stack() {
   log "=============================="
-  log "${C_BOLD}🐳 Install Podman stack (tanpa iptables)${C_RESET}"
+  log "${C_BOLD}🐳 Install Podman stack${C_RESET}"
   log "=============================="
 
-  local pkgs=(
-    podman
-    slirp4netns
-    fuse-overlayfs
-    shadow-utils-subid
-    policycoreutils-python-utils
-  )
-
+  local pkgs=(podman slirp4netns fuse-overlayfs shadow-utils-subid policycoreutils-python-utils)
   for p in "${pkgs[@]}"; do
-    if pkg_is_installed "$p"; then
-      ok "Paket sudah ada: $p"
-    else
-      if pkg_install "$p"; then
-        ok "Terpasang: $p"
-      else
-        fail_step "Gagal install paket Podman stack: $p"
-      fi
-    fi
+    pkg_install_one "$p" || true
   done
 
   if command -v podman >/dev/null 2>&1; then
@@ -186,7 +333,8 @@ enable_cockpit() {
   log "${C_BOLD}🧩 Enable Cockpit${C_RESET}"
   log "=============================="
 
-  pkg_install cockpit cockpit-ws >/dev/null 2>&1 || true
+  # ensure installed
+  run_with_spinner "Ensuring cockpit..." "$PKG_MGR" -y install cockpit cockpit-ws >>"$LOG_FILE" 2>&1 || true
 
   if systemctl list-unit-files | grep -q '^cockpit\.socket'; then
     enable_service_now cockpit.socket
@@ -204,7 +352,7 @@ configure_bash_completion() {
   if [[ -f /etc/profile.d/bash_completion.sh ]]; then
     if ! grep -qF "$line" /root/.bashrc 2>/dev/null; then
       echo "$line" >> /root/.bashrc
-      ok "Ditambahkan ke /root/.bashrc: $line"
+      ok "Ditambahkan ke /root/.bashrc"
     else
       ok "Sudah ada di /root/.bashrc"
     fi
@@ -219,7 +367,6 @@ configure_snmp() {
   log "=============================="
 
   mkdir -p /etc/snmp
-
   cat <<EOF > /etc/snmp/snmpd.conf
 com2sec readonly  default         public
 group   MyROGroup v2c             readonly
@@ -248,7 +395,7 @@ configure_chrony() {
     fi
 
     info "chronyc sources -v:"
-    chronyc sources -v | tee -a "$LOG_FILE" || warn "chronyc gagal (tunggu sync beberapa saat)."
+    chronyc sources -v 2>&1 | tee -a "$LOG_FILE" || warn "chronyc gagal (tunggu sync beberapa saat)."
   else
     fail_step "/etc/chrony.conf tidak ditemukan."
   fi
@@ -271,88 +418,17 @@ EOB
       echo "Banner /etc/issue.net" >> /etc/ssh/sshd_config
     fi
 
-    systemctl restart sshd >>"$LOG_FILE" 2>&1 && ok "Banner SSH aktif." || fail_step "Gagal restart sshd."
+    if systemctl restart sshd >>"$LOG_FILE" 2>&1; then
+      ok "Banner SSH aktif."
+    else
+      fail_step "Gagal restart sshd."
+    fi
   else
     fail_step "/etc/ssh/sshd_config tidak ditemukan."
   fi
 }
 
-# ---------- Git + Quadlet helpers ----------
-git_upsert_repo() {
-  local repo_url="$1"
-  local dest_dir="$2"
-
-  mkdir -p "$(dirname "$dest_dir")"
-
-  if [[ -d "$dest_dir/.git" ]]; then
-    info "git pull: $dest_dir"
-    if git -C "$dest_dir" pull --rebase >>"$LOG_FILE" 2>&1; then
-      ok "Git pull OK: $dest_dir"
-    else
-      warn "Git pull gagal: $dest_dir (lanjut pakai file lokal)"
-      fail_step "Git pull gagal: $dest_dir"
-    fi
-  else
-    info "git clone: $repo_url -> $dest_dir"
-    if git clone "$repo_url" "$dest_dir" >>"$LOG_FILE" 2>&1; then
-      ok "Git clone OK: $dest_dir"
-    else
-      fail_step "Git clone gagal: $dest_dir"
-    fi
-  fi
-}
-
-pull_images_from_quadlet_dir() {
-  local quadlet_dir="$1"
-  if [[ ! -d "$quadlet_dir" ]]; then
-    warn "Folder quadlet tidak ditemukan: $quadlet_dir (skip pull image)"
-    return 0
-  fi
-
-  info "Pull image dari Image= (*.container) di: $quadlet_dir"
-
-  local images=()
-  while IFS= read -r f; do
-    local img
-    img="$(grep -E '^\s*Image\s*=' "$f" | head -n1 | cut -d'=' -f2- | xargs || true)"
-    [[ -n "$img" ]] && images+=("$img")
-  done < <(find "$quadlet_dir" -maxdepth 1 -type f -name "*.container" 2>/dev/null)
-
-  if [[ "${#images[@]}" -eq 0 ]]; then
-    warn "Tidak ada Image= ditemukan di *.container (skip pull)."
-    return 0
-  fi
-
-  mapfile -t images < <(printf "%s\n" "${images[@]}" | awk '!seen[$0]++')
-
-  for img in "${images[@]}"; do
-    info "podman pull $img"
-    if podman pull "$img" >>"$LOG_FILE" 2>&1; then
-      ok "Pull OK: $img"
-    else
-      fail_step "Pull gagal: $img"
-    fi
-  done
-}
-
-systemd_reload() {
-  info "systemctl daemon-reload"
-  systemctl daemon-reload >>"$LOG_FILE" 2>&1 && ok "daemon-reload OK" || fail_step "daemon-reload gagal"
-}
-
-start_service() {
-  local svc="$1"
-  info "Start: $svc"
-  systemctl start "$svc" >>"$LOG_FILE" 2>&1 && ok "Running: $svc" || fail_step "Gagal start: $svc"
-}
-
-enable_now_services() {
-  # enable + start bareng
-  info "Enable --now: $*"
-  systemctl enable --now "$@" >>"$LOG_FILE" 2>&1 && ok "Enable --now sukses." || fail_step "Enable --now gagal."
-}
-
-# ---------- Deploy web apps ----------
+# ============ Deploys ============
 deploy_web_app_quadlet() {
   local app="$1"
   local repo="$2"
@@ -391,8 +467,8 @@ deploy_observium_quadlet() {
   ln -sf "$opt_dir/quadlet/observium_logs.volume"    "/etc/containers/systemd/observium_logs.volume"
   ln -sf "$opt_dir/quadlet/observium-db.container"   "/etc/containers/systemd/observium-db.container"
   ln -sf "$opt_dir/quadlet/observium-app.container"  "/etc/containers/systemd/observium-app.container"
-
   ok "Symlink Observium Quadlet selesai."
+
   systemd_reload
   start_service "observium-db.service"
   start_service "observium-app.service"
@@ -417,7 +493,6 @@ deploy_npm_quadlet() {
   start_service "npm.service"
 }
 
-# ---------- Deploy Zabbix (UPDATED sesuai script kamu) ----------
 deploy_zabbix_quadlet() {
   local repo="$1"
   local opt_dir="/opt/zabbix-integration"
@@ -464,7 +539,6 @@ deploy_zabbix_quadlet() {
 
   systemd_reload
 
-  # Start bareng (sesuai yang kamu minta)
   info "Start semua service Zabbix (bareng)..."
   systemctl start \
     zabbix-db.service \
@@ -474,17 +548,16 @@ deploy_zabbix_quadlet() {
     zabbix-backup.service \
     zbx-mikrotik-sync.service >>"$LOG_FILE" 2>&1 || true
 
-  # Enable --now bareng (ini juga akan memastikan running)
   enable_now_services \
     zabbix-db.service \
     zabbix-server.service \
     zabbix-web.service \
     zabbix-agent.service \
     zabbix-backup.service \
-    zbx-mikrotik-sync.service
+    zbx-mikrotik-sync.service || true
 }
 
-# ---------- MAIN ----------
+# ============ MAIN ============
 log "${C_BOLD}🧾 Mulai setup. Log: $LOG_FILE${C_RESET}"
 
 install_base_packages
@@ -495,9 +568,9 @@ configure_snmp
 configure_chrony
 configure_ssh_banner
 
-# Token env (JANGAN hardcode token di script/README)
+# Token env
 if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-  warn "GITHUB_TOKEN belum diset. Clone repo privat akan gagal."
+  warn "GITHUB_TOKEN belum diset. Repo private akan gagal."
   warn "Set dulu: export GITHUB_TOKEN='github_pat_xxxxx'"
 fi
 
@@ -513,8 +586,6 @@ deploy_web_app_quadlet "Web Fornet"      "$FORNET_REPO"   "/opt/web-fornet"   "w
 deploy_web_app_quadlet "Web HalssMakeup" "$HALSS_REPO"    "/opt/web-halss"    "web-halss.container"
 deploy_observium_quadlet "$OBSERVIUM_REPO" "/opt/Observium-Docker"
 deploy_npm_quadlet "$NPM_REPO"
-
-# Zabbix (UPDATED sesuai permintaan kamu)
 deploy_zabbix_quadlet "$ZBX_REPO"
 
 log ""
@@ -535,7 +606,7 @@ done
 
 log ""
 log "Quadlet dir: /etc/containers/systemd"
-ls -lah /etc/containers/systemd | tee -a "$LOG_FILE" || true
+ls -lah /etc/containers/systemd 2>&1 | tee -a "$LOG_FILE" || true
 log ""
 
 if [[ "${#FAILED_STEPS[@]}" -gt 0 ]]; then
