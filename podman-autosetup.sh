@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Setup Podman + tools + configs + Quadlet deployments (anti-gagal) + colored logs
+# Includes: Web HaloEats, Web Fornet, Web Halss, Observium, Nginx Proxy Manager, Zabbix Integration
 
 set -euo pipefail
 IFS=$'\n\t'
 
-LOG_FILE="/var/log/setup_podman_quadlet_stack.log"
+LOG_FILE="/var/log/podman-autosetup.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 
 # ---- Color handling (only for TTY) ----
@@ -23,14 +24,11 @@ fi
 
 ts() { date +"%Y-%m-%d %H:%M:%S"; }
 
-# log_raw: write to file (no color)
-log_raw() { echo -e "[$(ts)] $*" >>"$LOG_FILE"; }
-
-# log: print colored + tee to file (plain)
 log() {
   local msg="$*"
-  # strip ANSI for file safety (we never add ANSI to file anyway)
+  # write plain (no ANSI) to log file
   echo -e "[$(ts)] ${msg}" | sed -r 's/\x1B\[[0-9;]*[mK]//g' >>"$LOG_FILE"
+  # print to screen (colored already inside msg)
   echo -e "[$(ts)] ${msg}"
 }
 
@@ -41,6 +39,8 @@ err()  { log "${C_RED}❌ $*${C_RESET}"; }
 
 FAILED_STEPS=()
 fail_step() { FAILED_STEPS+=("$1"); err "$1"; }
+
+trap 'err "Script error di baris $LINENO (cek log: $LOG_FILE)"; exit 1' ERR
 
 if [[ "${EUID}" -ne 0 ]]; then
   err "Harus dijalankan sebagai root. Jalankan: sudo -i"
@@ -109,13 +109,11 @@ install_base_packages() {
   pkg_update
   ensure_epel
 
-  # NOTE: jangan pakai "snmp" karena tidak ada paketnya di EL.
-  # Gunakan net-snmp & net-snmp-utils.
+  # "yum-utils" di sebagian RHEL/Alma modern bisa tidak ada -> fallback dnf-utils
   local pkgs=(
     curl wget git nano tree
     net-tools bind-utils traceroute
     chrony bash-completion
-    yum-utils
     cockpit cockpit-ws
     net-snmp net-snmp-utils
     htop
@@ -132,11 +130,25 @@ install_base_packages() {
       fi
     fi
   done
+
+  # utils tambahan: yum-utils atau dnf-utils
+  if pkg_is_installed yum-utils; then
+    ok "Paket sudah ada: yum-utils"
+  else
+    info "(Opsional) Install yum-utils/dnf-utils..."
+    if $PKG_MGR -y install yum-utils >>"$LOG_FILE" 2>&1; then
+      ok "Terpasang: yum-utils"
+    elif $PKG_MGR -y install dnf-utils >>"$LOG_FILE" 2>&1; then
+      ok "Terpasang: dnf-utils"
+    else
+      warn "yum-utils/dnf-utils tidak bisa diinstall (skip)."
+    fi
+  fi
 }
 
 install_podman_stack() {
   log "=============================="
-  log "${C_BOLD}🐳 Memastikan Podman + dependensi (compatible)${C_RESET}"
+  log "${C_BOLD}🐳 Install Podman stack (tanpa iptables)${C_RESET}"
   log "=============================="
 
   local pkgs=(
@@ -171,7 +183,7 @@ install_podman_stack() {
 
 enable_cockpit() {
   log "=============================="
-  log "${C_BOLD}🧩 Mengaktifkan Cockpit${C_RESET}"
+  log "${C_BOLD}🧩 Enable Cockpit${C_RESET}"
   log "=============================="
 
   pkg_install cockpit cockpit-ws >/dev/null 2>&1 || true
@@ -179,13 +191,13 @@ enable_cockpit() {
   if systemctl list-unit-files | grep -q '^cockpit\.socket'; then
     enable_service_now cockpit.socket
   else
-    warn "cockpit.socket tidak ada. Coba cek: systemctl list-unit-files | grep cockpit"
+    warn "cockpit.socket tidak ditemukan. Cek: systemctl list-unit-files | grep cockpit"
   fi
 }
 
 configure_bash_completion() {
   log "=============================="
-  log "${C_BOLD}⌨️  Mengaktifkan bash-completion${C_RESET}"
+  log "${C_BOLD}⌨️  Bash completion${C_RESET}"
   log "=============================="
 
   local line='source /etc/profile.d/bash_completion.sh'
@@ -203,8 +215,10 @@ configure_bash_completion() {
 
 configure_snmp() {
   log "=============================="
-  log "${C_BOLD}📡 Konfigurasi SNMP v2c${C_RESET}"
+  log "${C_BOLD}📡 SNMP v2c${C_RESET}"
   log "=============================="
+
+  mkdir -p /etc/snmp
 
   cat <<EOF > /etc/snmp/snmpd.conf
 com2sec readonly  default         public
@@ -215,22 +229,24 @@ syslocation Jakarta, Indonesia
 syscontact reski.abuchaer@gmail.com
 EOF
 
-  enable_service_now snmpd
+  enable_service_now snmpd.service || true
+  enable_service_now snmpd || true
 }
 
 configure_chrony() {
   log "=============================="
-  log "${C_BOLD}🕒 Konfigurasi Chrony (NTP)${C_RESET}"
+  log "${C_BOLD}🕒 Chrony (NTP)${C_RESET}"
   log "=============================="
 
   if [[ -f /etc/chrony.conf ]]; then
     sed -i 's|^pool.*|server 0.id.pool.ntp.org iburst\nserver 1.id.pool.ntp.org iburst|' /etc/chrony.conf
-    # on EL9/10 biasanya chronyd.service
+
     if systemctl list-unit-files | grep -q '^chronyd\.service'; then
       enable_service_now chronyd.service
     else
       enable_service_now chronyd
     fi
+
     info "chronyc sources -v:"
     chronyc sources -v | tee -a "$LOG_FILE" || warn "chronyc gagal (tunggu sync beberapa saat)."
   else
@@ -240,7 +256,7 @@ configure_chrony() {
 
 configure_ssh_banner() {
   log "=============================="
-  log "${C_BOLD}🛡️  Banner SSH${C_RESET}"
+  log "${C_BOLD}🛡️  SSH Banner${C_RESET}"
   log "=============================="
 
   cat <<'EOB' > /etc/issue.net
@@ -255,17 +271,13 @@ EOB
       echo "Banner /etc/issue.net" >> /etc/ssh/sshd_config
     fi
 
-    if systemctl restart sshd >>"$LOG_FILE" 2>&1; then
-      ok "sshd restart OK (banner aktif)."
-    else
-      fail_step "Gagal restart sshd."
-    fi
+    systemctl restart sshd >>"$LOG_FILE" 2>&1 && ok "Banner SSH aktif." || fail_step "Gagal restart sshd."
   else
     fail_step "/etc/ssh/sshd_config tidak ditemukan."
   fi
 }
 
-# ---------- Git + Quadlet ----------
+# ---------- Git + Quadlet helpers ----------
 git_upsert_repo() {
   local repo_url="$1"
   local dest_dir="$2"
@@ -273,17 +285,17 @@ git_upsert_repo() {
   mkdir -p "$(dirname "$dest_dir")"
 
   if [[ -d "$dest_dir/.git" ]]; then
-    info "Repo sudah ada, git pull: $dest_dir"
+    info "git pull: $dest_dir"
     if git -C "$dest_dir" pull --rebase >>"$LOG_FILE" 2>&1; then
-      ok "Pull sukses: $dest_dir"
+      ok "Git pull OK: $dest_dir"
     else
       warn "Git pull gagal: $dest_dir (lanjut pakai file lokal)"
       fail_step "Git pull gagal: $dest_dir"
     fi
   else
-    info "Clone: $repo_url -> $dest_dir"
+    info "git clone: $repo_url -> $dest_dir"
     if git clone "$repo_url" "$dest_dir" >>"$LOG_FILE" 2>&1; then
-      ok "Clone sukses: $dest_dir"
+      ok "Git clone OK: $dest_dir"
     else
       fail_step "Git clone gagal: $dest_dir"
     fi
@@ -293,11 +305,11 @@ git_upsert_repo() {
 pull_images_from_quadlet_dir() {
   local quadlet_dir="$1"
   if [[ ! -d "$quadlet_dir" ]]; then
-    fail_step "Folder quadlet tidak ditemukan: $quadlet_dir"
+    warn "Folder quadlet tidak ditemukan: $quadlet_dir (skip pull image)"
     return 0
   fi
 
-  info "Pull image berdasarkan Image= dari *.container di: $quadlet_dir"
+  info "Pull image dari Image= (*.container) di: $quadlet_dir"
 
   local images=()
   while IFS= read -r f; do
@@ -307,7 +319,7 @@ pull_images_from_quadlet_dir() {
   done < <(find "$quadlet_dir" -maxdepth 1 -type f -name "*.container" 2>/dev/null)
 
   if [[ "${#images[@]}" -eq 0 ]]; then
-    warn "Tidak ada Image= ditemukan di file *.container (skip pull)."
+    warn "Tidak ada Image= ditemukan di *.container (skip pull)."
     return 0
   fi
 
@@ -323,39 +335,24 @@ pull_images_from_quadlet_dir() {
   done
 }
 
-link_quadlet_unit() {
-  local src="$1"
-  local dst="$2"
-
-  if [[ ! -f "$src" ]]; then
-    fail_step "File quadlet tidak ditemukan: $src"
-    return 0
-  fi
-
-  mkdir -p "$(dirname "$dst")"
-  ln -sf "$src" "$dst"
-  ok "Symlink OK: $dst -> $src"
-}
-
 systemd_reload() {
   info "systemctl daemon-reload"
-  if systemctl daemon-reload >>"$LOG_FILE" 2>&1; then
-    ok "daemon-reload OK"
-  else
-    fail_step "daemon-reload gagal"
-  fi
+  systemctl daemon-reload >>"$LOG_FILE" 2>&1 && ok "daemon-reload OK" || fail_step "daemon-reload gagal"
 }
 
 start_service() {
   local svc="$1"
   info "Start: $svc"
-  if systemctl start "$svc" >>"$LOG_FILE" 2>&1; then
-    ok "Running: $svc"
-  else
-    fail_step "Gagal start: $svc"
-  fi
+  systemctl start "$svc" >>"$LOG_FILE" 2>&1 && ok "Running: $svc" || fail_step "Gagal start: $svc"
 }
 
+enable_now_services() {
+  # enable + start bareng
+  info "Enable --now: $*"
+  systemctl enable --now "$@" >>"$LOG_FILE" 2>&1 && ok "Enable --now sukses." || fail_step "Enable --now gagal."
+}
+
+# ---------- Deploy web apps ----------
 deploy_web_app_quadlet() {
   local app="$1"
   local repo="$2"
@@ -369,11 +366,11 @@ deploy_web_app_quadlet() {
   git_upsert_repo "$repo" "$opt_dir"
   pull_images_from_quadlet_dir "$opt_dir/quadlet"
 
-  link_quadlet_unit "$opt_dir/quadlet/$unit_file" "/etc/containers/systemd/$unit_file"
-  systemd_reload
+  ln -sf "$opt_dir/quadlet/$unit_file" "/etc/containers/systemd/$unit_file"
+  ok "Symlink: /etc/containers/systemd/$unit_file -> $opt_dir/quadlet/$unit_file"
 
-  local svc="${unit_file%.container}.service"
-  start_service "$svc"
+  systemd_reload
+  start_service "${unit_file%.container}.service"
 }
 
 deploy_observium_quadlet() {
@@ -387,20 +384,20 @@ deploy_observium_quadlet() {
   git_upsert_repo "$repo" "$opt_dir"
   pull_images_from_quadlet_dir "$opt_dir/quadlet"
 
-  link_quadlet_unit "$opt_dir/quadlet/observium.network"        "/etc/containers/systemd/observium.network"
-  link_quadlet_unit "$opt_dir/quadlet/db_data.volume"           "/etc/containers/systemd/db_data.volume"
-  link_quadlet_unit "$opt_dir/quadlet/observium_data.volume"    "/etc/containers/systemd/observium_data.volume"
-  link_quadlet_unit "$opt_dir/quadlet/observium_rrd.volume"     "/etc/containers/systemd/observium_rrd.volume"
-  link_quadlet_unit "$opt_dir/quadlet/observium_logs.volume"    "/etc/containers/systemd/observium_logs.volume"
-  link_quadlet_unit "$opt_dir/quadlet/observium-db.container"   "/etc/containers/systemd/observium-db.container"
-  link_quadlet_unit "$opt_dir/quadlet/observium-app.container"  "/etc/containers/systemd/observium-app.container"
+  ln -sf "$opt_dir/quadlet/observium.network"        "/etc/containers/systemd/observium.network"
+  ln -sf "$opt_dir/quadlet/db_data.volume"           "/etc/containers/systemd/db_data.volume"
+  ln -sf "$opt_dir/quadlet/observium_data.volume"    "/etc/containers/systemd/observium_data.volume"
+  ln -sf "$opt_dir/quadlet/observium_rrd.volume"     "/etc/containers/systemd/observium_rrd.volume"
+  ln -sf "$opt_dir/quadlet/observium_logs.volume"    "/etc/containers/systemd/observium_logs.volume"
+  ln -sf "$opt_dir/quadlet/observium-db.container"   "/etc/containers/systemd/observium-db.container"
+  ln -sf "$opt_dir/quadlet/observium-app.container"  "/etc/containers/systemd/observium-app.container"
 
+  ok "Symlink Observium Quadlet selesai."
   systemd_reload
   start_service "observium-db.service"
   start_service "observium-app.service"
 }
 
-# ---------- Nginx Proxy Manager ----------
 deploy_npm_quadlet() {
   local repo="$1"
   local opt_dir="/opt/NginxProxyManager"
@@ -412,18 +409,16 @@ deploy_npm_quadlet() {
 
   git_upsert_repo "$repo" "$opt_dir"
   pull_images_from_quadlet_dir "$opt_dir/quadlet"
-  link_quadlet_unit "$opt_dir/quadlet/$unit_file" "/etc/containers/systemd/$unit_file"
+
+  ln -sf "$opt_dir/quadlet/$unit_file" "/etc/containers/systemd/$unit_file"
+  ok "Symlink: /etc/containers/systemd/$unit_file -> $opt_dir/quadlet/$unit_file"
+
   systemd_reload
   start_service "npm.service"
 }
 
-# ---------- Zabbix integration ----------
-extract_image_from_unit() {
-  local file="$1"
-  grep -E '^\s*Image\s*=' "$file" | head -n1 | cut -d'=' -f2- | xargs || true
-}
-
-deploy_zabbix_integration_quadlet() {
+# ---------- Deploy Zabbix (UPDATED sesuai script kamu) ----------
+deploy_zabbix_quadlet() {
   local repo="$1"
   local opt_dir="/opt/zabbix-integration"
 
@@ -434,55 +429,63 @@ deploy_zabbix_integration_quadlet() {
   git_upsert_repo "$repo" "$opt_dir"
   pull_images_from_quadlet_dir "$opt_dir/quadlet"
 
-  # symlinks (sesuai list kamu)
-  link_quadlet_unit "$opt_dir/quadlet/zabbix.network"                 "/etc/containers/systemd/zabbix.network"
-  link_quadlet_unit "$opt_dir/quadlet/zabbix-postgres.volume"         "/etc/containers/systemd/zabbix-postgres.volume"
-  link_quadlet_unit "$opt_dir/quadlet/zabbix-postgres-backup.volume"  "/etc/containers/systemd/zabbix-postgres-backup.volume"
-  link_quadlet_unit "$opt_dir/quadlet/zabbix-database-backups.volume" "/etc/containers/systemd/zabbix-database-backups.volume"
-  link_quadlet_unit "$opt_dir/quadlet/postgres.container"             "/etc/containers/systemd/postgres.container"
-  link_quadlet_unit "$opt_dir/quadlet/zabbix-server.container"        "/etc/containers/systemd/zabbix-server.container"
-  link_quadlet_unit "$opt_dir/quadlet/zabbix-dashboard.container"     "/etc/containers/systemd/zabbix-dashboard.container"
-  link_quadlet_unit "$opt_dir/quadlet/zabbix-agent.container"         "/etc/containers/systemd/zabbix-agent.container"
-  link_quadlet_unit "$opt_dir/quadlet/backups.container"              "/etc/containers/systemd/backups.container"
-  link_quadlet_unit "$opt_dir/quadlet/zbx-mikrotik-sync.container"    "/etc/containers/systemd/zbx-mikrotik-sync.container"
+  # === SYMLINK PERSIS SESUAI FORMAT YANG KAMU KASIH ===
+  ln -sf /opt/zabbix-integration/quadlet/zabbix.network \
+         /etc/containers/systemd/zabbix.network
+
+  ln -sf /opt/zabbix-integration/quadlet/zabbix-postgres.volume \
+         /etc/containers/systemd/zabbix-postgres.volume
+
+  ln -sf /opt/zabbix-integration/quadlet/zabbix-postgres-backup.volume \
+         /etc/containers/systemd/zabbix-postgres-backup.volume
+
+  ln -sf /opt/zabbix-integration/quadlet/zabbix-database-backups.volume \
+         /etc/containers/systemd/zabbix-database-backups.volume
+
+  ln -sf /opt/zabbix-integration/quadlet/zabbix-db.container \
+         /etc/containers/systemd/zabbix-db.container
+
+  ln -sf /opt/zabbix-integration/quadlet/zabbix-server.container \
+         /etc/containers/systemd/zabbix-server.container
+
+  ln -sf /opt/zabbix-integration/quadlet/zabbix-web.container \
+         /etc/containers/systemd/zabbix-web.container
+
+  ln -sf /opt/zabbix-integration/quadlet/zabbix-agent.container \
+         /etc/containers/systemd/zabbix-agent.container
+
+  ln -sf /opt/zabbix-integration/quadlet/zabbix-backup.container \
+         /etc/containers/systemd/zabbix-backup.container
+
+  ln -sf /opt/zabbix-integration/quadlet/zbx-mikrotik-sync.container \
+         /etc/containers/systemd/zbx-mikrotik-sync.container
+
+  ok "Symlink Zabbix Quadlet selesai."
 
   systemd_reload
 
-  start_service "postgres.service"
-  start_service "zabbix-server.service"
-  start_service "zabbix-dashboard.service"
-  start_service "zabbix-agent.service"
-  start_service "backups.service"
+  # Start bareng (sesuai yang kamu minta)
+  info "Start semua service Zabbix (bareng)..."
+  systemctl start \
+    zabbix-db.service \
+    zabbix-server.service \
+    zabbix-web.service \
+    zabbix-agent.service \
+    zabbix-backup.service \
+    zbx-mikrotik-sync.service >>"$LOG_FILE" 2>&1 || true
 
-  # --- Special: tampilkan file zbx-mikrotik-sync.container + purge image + reload ulang ---
-  local sync_unit="/etc/containers/systemd/zbx-mikrotik-sync.container"
-  if [[ -f "$sync_unit" ]]; then
-    log "------------------------------"
-    log "${C_BOLD}📄 Isi zbx-mikrotik-sync.container (untuk API Zabbix)${C_RESET}"
-    log "------------------------------"
-    # tampilkan ke layar (juga masuk log)
-    sed 's/\r$//' "$sync_unit" | tee -a "$LOG_FILE"
-
-    # hapus image agar tidak cache (kalau ada)
-    local img
-    img="$(extract_image_from_unit "$sync_unit")"
-    if [[ -n "$img" ]]; then
-      warn "Purge image untuk zbx-mikrotik-sync: $img"
-      podman rm -f zbx-mikrotik-sync  >/dev/null 2>&1 || true
-      podman rmi -f "$img"            >>"$LOG_FILE" 2>&1 || true
-      systemd_reload
-      start_service "zbx-mikrotik-sync.service" || true
-      ok "zbx-mikrotik-sync purge+reload selesai (cek service jika perlu)."
-    else
-      warn "Tidak menemukan Image= di zbx-mikrotik-sync.container (skip purge)."
-    fi
-  else
-    warn "File zbx-mikrotik-sync.container tidak ditemukan (skip display/purge)."
-  fi
+  # Enable --now bareng (ini juga akan memastikan running)
+  enable_now_services \
+    zabbix-db.service \
+    zabbix-server.service \
+    zabbix-web.service \
+    zabbix-agent.service \
+    zabbix-backup.service \
+    zbx-mikrotik-sync.service
 }
 
 # ---------- MAIN ----------
-log "${C_BOLD}🧾 Mulai setup (log: $LOG_FILE)${C_RESET}"
+log "${C_BOLD}🧾 Mulai setup. Log: $LOG_FILE${C_RESET}"
 
 install_base_packages
 install_podman_stack
@@ -492,10 +495,10 @@ configure_snmp
 configure_chrony
 configure_ssh_banner
 
-# Token: jangan hardcode PAT di script (biar aman dari push protection)
+# Token env (JANGAN hardcode token di script/README)
 if [[ -z "${GITHUB_TOKEN:-}" ]]; then
   warn "GITHUB_TOKEN belum diset. Clone repo privat akan gagal."
-  warn "Set dulu: export GITHUB_TOKEN='xxxxx' (jangan taruh token di README/script repo publik)"
+  warn "Set dulu: export GITHUB_TOKEN='github_pat_xxxxx'"
 fi
 
 HALOEATS_REPO="https://${GITHUB_TOKEN:-TOKEN_KOSONG}@github.com/rskabc/web-haloeats.git"
@@ -509,9 +512,10 @@ deploy_web_app_quadlet "Web HaloEats"    "$HALOEATS_REPO" "/opt/web-haloeats" "w
 deploy_web_app_quadlet "Web Fornet"      "$FORNET_REPO"   "/opt/web-fornet"   "web-fornet.container"
 deploy_web_app_quadlet "Web HalssMakeup" "$HALSS_REPO"    "/opt/web-halss"    "web-halss.container"
 deploy_observium_quadlet "$OBSERVIUM_REPO" "/opt/Observium-Docker"
-
 deploy_npm_quadlet "$NPM_REPO"
-deploy_zabbix_integration_quadlet "$ZBX_REPO"
+
+# Zabbix (UPDATED sesuai permintaan kamu)
+deploy_zabbix_quadlet "$ZBX_REPO"
 
 log ""
 log "=============================="
@@ -523,12 +527,12 @@ log "SNMPD      : $(systemctl is-active snmpd 2>/dev/null || echo 'unknown')"
 log "Chronyd    : $(systemctl is-active chronyd 2>/dev/null || echo 'unknown')"
 log "SSHD       : $(systemctl is-active sshd 2>/dev/null || echo 'unknown')"
 log ""
-log "Services:"
-for s in web-haloeats.service web-fornet.service web-halss.service \
-         observium-db.service observium-app.service \
-         npm.service postgres.service zabbix-server.service zabbix-dashboard.service zabbix-agent.service backups.service zbx-mikrotik-sync.service; do
+
+log "Zabbix services:"
+for s in zabbix-db.service zabbix-server.service zabbix-web.service zabbix-agent.service zabbix-backup.service zbx-mikrotik-sync.service; do
   log " - $s : $(systemctl is-active "$s" 2>/dev/null || echo 'unknown')"
 done
+
 log ""
 log "Quadlet dir: /etc/containers/systemd"
 ls -lah /etc/containers/systemd | tee -a "$LOG_FILE" || true
