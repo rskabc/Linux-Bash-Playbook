@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Podman + tools + configs + Quadlet deployments (anti-gagal) + visible loading/progress
-# Target: Alma/RHEL-like
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -23,7 +21,6 @@ fi
 
 ts() { date +"%Y-%m-%d %H:%M:%S"; }
 
-# write plain (no ANSI) to log file, show colored to screen
 _log_plain_to_file() {
   echo -e "$*" | sed -r 's/\x1B\[[0-9;]*[mK]//g' >>"$LOG_FILE"
 }
@@ -44,7 +41,7 @@ fail_step() { FAILED_STEPS+=("$1"); err "$1"; }
 
 trap 'err "Script error di baris $LINENO (cek log: $LOG_FILE)"; exit 1' ERR
 
-# ============ Spinner (for commands redirected to log) ============
+# ============ Spinner ============
 spinner() {
   local pid="$1"
   local msg="${2:-Working...}"
@@ -73,7 +70,7 @@ run_with_spinner() {
   spinner "$pid" "$msg"
 }
 
-# ============ Root check ============
+# ============ Root ============
 if [[ "${EUID}" -ne 0 ]]; then
   err "Harus dijalankan sebagai root. Jalankan: sudo -i"
   exit 1
@@ -117,20 +114,6 @@ pkg_install_one() {
   fi
 }
 
-enable_service_now() {
-  local svc="$1"
-  if systemctl list-unit-files | grep -qE "^${svc}\."; then
-    info "Enable & start: $svc"
-    if systemctl enable --now "$svc" >>"$LOG_FILE" 2>&1; then
-      ok "$svc aktif."
-    else
-      fail_step "Gagal enable/start service: $svc"
-    fi
-  else
-    warn "Unit $svc tidak ditemukan (skip)."
-  fi
-}
-
 systemd_reload() {
   info "systemctl daemon-reload"
   if systemctl daemon-reload >>"$LOG_FILE" 2>&1; then
@@ -160,38 +143,73 @@ enable_now_services() {
   fi
 }
 
-# ============ Podman pull progress ============
+enable_service_now() {
+  local svc="$1"
+  if systemctl list-unit-files | grep -qE "^${svc}\."; then
+    info "Enable & start: $svc"
+    if systemctl enable --now "$svc" >>"$LOG_FILE" 2>&1; then
+      ok "$svc aktif."
+    else
+      fail_step "Gagal enable/start service: $svc"
+    fi
+  else
+    warn "Unit $svc tidak ditemukan (skip)."
+  fi
+}
+
+# ============ Podman pull (NO --progress, auto fallback) ============
+PODMAN_PULL_PROGRESS_MODE=""  # "none" or "auto"
+detect_podman_pull_progress() {
+  # beberapa versi podman tidak punya --progress
+  if podman pull --help 2>/dev/null | grep -q -- '--progress'; then
+    PODMAN_PULL_PROGRESS_MODE="progress"
+  else
+    PODMAN_PULL_PROGRESS_MODE="none"
+  fi
+  ok "Podman pull progress mode: $PODMAN_PULL_PROGRESS_MODE"
+}
+
 podman_pull_pretty() {
   local img="$1"
 
-  # Skip pull for local-tag images
+  # skip pull local tag
   if [[ "$img" =~ ^localhost/ ]]; then
     warn "Skip pull (image lokal): $img"
     return 0
   fi
 
   info "Pull image: $img"
+
+  # TTY mode: tampilkan output podman apa adanya biar kelihatan loading
   if [[ -t 1 ]]; then
-    # show progress bar, also log via tee
-    if podman pull --progress=bar "$img" 2>&1 | tee -a "$LOG_FILE"; then
-      ok "Pull OK: $img"
-      return 0
+    if [[ "$PODMAN_PULL_PROGRESS_MODE" == "progress" ]]; then
+      # kalau support
+      if podman pull --progress=auto "$img" 2>&1 | tee -a "$LOG_FILE"; then
+        ok "Pull OK: $img"; return 0
+      else
+        fail_step "Pull gagal: $img"; return 1
+      fi
     else
-      fail_step "Pull gagal: $img"
-      return 1
+      # fallback tanpa flag progress
+      if podman pull "$img" 2>&1 | tee -a "$LOG_FILE"; then
+        ok "Pull OK: $img"; return 0
+      else
+        fail_step "Pull gagal: $img"; return 1
+      fi
     fi
+  fi
+
+  # non-TTY: spinner + log
+  if run_with_spinner "Pulling $img..." podman pull "$img"; then
+    ok "Pull OK: $img"
+    return 0
   else
-    if run_with_spinner "Pulling $img..." podman pull "$img"; then
-      ok "Pull OK: $img"
-      return 0
-    else
-      fail_step "Pull gagal: $img"
-      return 1
-    fi
+    fail_step "Pull gagal: $img"
+    return 1
   fi
 }
 
-# ============ Git helpers ============
+# ============ Git ============
 git_upsert_repo() {
   local repo_url="$1"
   local dest_dir="$2"
@@ -234,7 +252,7 @@ git_upsert_repo() {
 pull_images_from_quadlet_dir() {
   local quadlet_dir="$1"
   if [[ ! -d "$quadlet_dir" ]]; then
-    warn "Folder quadlet tidak ditemukan: $quadlet_dir (skip pull image)"
+    warn "Folder quadlet tidak ditemukan: $quadlet_dir (skip pull)"
     return 0
   fi
 
@@ -258,7 +276,7 @@ pull_images_from_quadlet_dir() {
   done
 }
 
-# ============ Config steps ============
+# ============ Install / Config ============
 ensure_epel() {
   if ! pkg_is_installed epel-release; then
     info "Install epel-release..."
@@ -326,6 +344,8 @@ install_podman_stack() {
 
   mkdir -p /etc/containers/systemd
   ok "Folder Quadlet siap: /etc/containers/systemd"
+
+  detect_podman_pull_progress
 }
 
 enable_cockpit() {
@@ -333,7 +353,6 @@ enable_cockpit() {
   log "${C_BOLD}🧩 Enable Cockpit${C_RESET}"
   log "=============================="
 
-  # ensure installed
   run_with_spinner "Ensuring cockpit..." "$PKG_MGR" -y install cockpit cockpit-ws >>"$LOG_FILE" 2>&1 || true
 
   if systemctl list-unit-files | grep -q '^cockpit\.socket'; then
@@ -387,12 +406,7 @@ configure_chrony() {
 
   if [[ -f /etc/chrony.conf ]]; then
     sed -i 's|^pool.*|server 0.id.pool.ntp.org iburst\nserver 1.id.pool.ntp.org iburst|' /etc/chrony.conf
-
-    if systemctl list-unit-files | grep -q '^chronyd\.service'; then
-      enable_service_now chronyd.service
-    else
-      enable_service_now chronyd
-    fi
+    enable_service_now chronyd.service || enable_service_now chronyd || true
 
     info "chronyc sources -v:"
     chronyc sources -v 2>&1 | tee -a "$LOG_FILE" || warn "chronyc gagal (tunggu sync beberapa saat)."
@@ -428,7 +442,7 @@ EOB
   fi
 }
 
-# ============ Deploys ============
+# ============ Deploy ============
 deploy_web_app_quadlet() {
   local app="$1"
   local repo="$2"
@@ -504,7 +518,6 @@ deploy_zabbix_quadlet() {
   git_upsert_repo "$repo" "$opt_dir"
   pull_images_from_quadlet_dir "$opt_dir/quadlet"
 
-  # === SYMLINK PERSIS SESUAI FORMAT YANG KAMU KASIH ===
   ln -sf /opt/zabbix-integration/quadlet/zabbix.network \
          /etc/containers/systemd/zabbix.network
 
@@ -536,7 +549,6 @@ deploy_zabbix_quadlet() {
          /etc/containers/systemd/zbx-mikrotik-sync.container
 
   ok "Symlink Zabbix Quadlet selesai."
-
   systemd_reload
 
   info "Start semua service Zabbix (bareng)..."
@@ -568,7 +580,6 @@ configure_snmp
 configure_chrony
 configure_ssh_banner
 
-# Token env
 if [[ -z "${GITHUB_TOKEN:-}" ]]; then
   warn "GITHUB_TOKEN belum diset. Repo private akan gagal."
   warn "Set dulu: export GITHUB_TOKEN='github_pat_xxxxx'"
@@ -599,12 +610,6 @@ log "Chronyd    : $(systemctl is-active chronyd 2>/dev/null || echo 'unknown')"
 log "SSHD       : $(systemctl is-active sshd 2>/dev/null || echo 'unknown')"
 log ""
 
-log "Zabbix services:"
-for s in zabbix-db.service zabbix-server.service zabbix-web.service zabbix-agent.service zabbix-backup.service zbx-mikrotik-sync.service; do
-  log " - $s : $(systemctl is-active "$s" 2>/dev/null || echo 'unknown')"
-done
-
-log ""
 log "Quadlet dir: /etc/containers/systemd"
 ls -lah /etc/containers/systemd 2>&1 | tee -a "$LOG_FILE" || true
 log ""
